@@ -1,6 +1,7 @@
 import { BufferConverter, DeviceManager, FFmpegInput, MediaManager, MediaObject as MediaObjectInterface, MediaObjectOptions, MediaStreamUrl, ScryptedDevice, ScryptedInterface, ScryptedInterfaceProperty, ScryptedMimeTypes, ScryptedNativeId, SystemDeviceState, SystemManager } from "@scrypted/types";
 import axios from 'axios';
-import pathToFfmpeg from 'ffmpeg-static';
+// import pathToFfmpeg from 'ffmpeg-static';
+var pathToFfmpeg='/usr/local/bin/ffmpeg';
 import fs from 'fs';
 import https from 'https';
 import mimeType from 'mime';
