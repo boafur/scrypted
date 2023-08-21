@@ -7,7 +7,6 @@ import fs from 'fs';
 import http from 'http';
 import httpAuth from 'http-auth';
 import https from 'https';
-import mkdirp from 'mkdirp';
 import net from 'net';
 import os from 'os';
 import path from 'path';
@@ -16,7 +15,7 @@ import semver from 'semver';
 import { install as installSourceMapSupport } from 'source-map-support';
 import { createSelfSignedCertificate, CURRENT_SELF_SIGNED_CERTIFICATE_VERSION } from './cert';
 import { Plugin, ScryptedUser, Settings } from './db-types';
-import level, { Level } from './level';
+import Level from './level';
 import { PluginError } from './plugin/plugin-error';
 import { getScryptedVolume } from './plugin/plugin-volume';
 import { RPCResultError } from './rpc';
@@ -116,15 +115,11 @@ async function start(mainFilename: string, options?: {
     onRuntimeCreated?: (runtime: ScryptedRuntime) => Promise<void>,
 }) {
     const volumeDir = getScryptedVolume();
-    mkdirp.sync(volumeDir);
+    await fs.promises.mkdir(volumeDir, {
+        recursive: true
+    });
     const dbPath = path.join(volumeDir, 'scrypted.db');
-    const db = await new Promise<Level>((r, f) => {
-        const db = level(dbPath, undefined, (e) => {
-            if (e)
-                return f(e);
-            r(db);
-        });
-    })
+    const db = new Level(dbPath);
     await db.open();
 
     let certSetting = await db.tryGet(Settings, 'certificate') as Settings;
@@ -142,11 +137,6 @@ async function start(mainFilename: string, options?: {
         realm: 'Scrypted',
     }, async (username, password, callback) => {
         const user = await db.tryGet(ScryptedUser, username);
-        // disallow basic auth for non-admin as it can deploy plugins, etc.
-        if (!user || user.aclId) {
-            callback(false);
-            return;
-        }
 
         const salted = user.salt + password;
         const hash = crypto.createHash('sha256');
@@ -302,7 +292,7 @@ async function start(mainFilename: string, options?: {
         next();
     })
 
-    // verify all plugin related requests have some sort of auth
+    // verify all plugin related requests have admin auth
     app.all('/web/component/*', (req, res, next) => {
         if (!res.locals.username || res.locals.aclId) {
             res.status(401);
@@ -365,20 +355,6 @@ async function start(mainFilename: string, options?: {
         }
         catch (e) {
             console.error('plugin installation failed', e);
-            res.status(500);
-            res.end();
-        }
-    });
-
-    app.get('/web/component/script/search', async (req, res) => {
-        try {
-            const query = new URLSearchParams({
-                text: req.query.text.toString(),
-            })
-            const response = await axios(`https://registry.npmjs.org/-/v1/search?${query}`);
-            res.send(response.data);
-        }
-        catch (e) {
             res.status(500);
             res.end();
         }

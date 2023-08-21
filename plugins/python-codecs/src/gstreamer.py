@@ -105,10 +105,10 @@ class GstImage(scrypted_sdk.Image):
             raise Exception("unable to map gst buffer")
 
         try:
-            # pil = pilimage.new_from_memory(info.data, width, height, capsBands)
-            # pil.convert('RGB').save('/server/volume/test.jpg')
-
             stridePadding = (width * capsBands) % 4
+            if stridePadding:
+                stridePadding = 4 - stridePadding
+
             if stridePadding:
                 if capsBands != 1:
                     raise Exception(
@@ -131,6 +131,10 @@ class GstImage(scrypted_sdk.Image):
                 pil = pilimage.new_from_memory(info.data, width, height, capsBands)
                 image = pilimage.PILImage(pil)
 
+            # if bands == 1:
+            #     pil = pilimage.new_from_memory(info.data, width, height, capsBands)
+            #     pil.convert('RGB').save('/server/volume/test.jpg')
+
             crop = None
             if stridePadding:
                 crop = {
@@ -144,6 +148,7 @@ class GstImage(scrypted_sdk.Image):
             if bands and bands != capsBands:
                 reformat = format
 
+            colored = None
             if reformat or crop:
                 colored = image
                 image = await image.toImageInternal(
@@ -152,8 +157,6 @@ class GstImage(scrypted_sdk.Image):
                         "format": reformat,
                     }
                 )
-                asyncio.ensure_future(colored.close(), loop = asyncio.get_event_loop())
-
             try:
                 return await image.toBuffer(
                     {
@@ -162,6 +165,8 @@ class GstImage(scrypted_sdk.Image):
                 )
             finally:
                 await image.close()
+                if colored:
+                    await colored.close()
         finally:
             gst_buffer.unmap(info)
 
@@ -350,7 +355,7 @@ async def generateVideoFramesGstreamer(
             if platform.system() == "Darwin":
                 decoder = "vtdec_hw"
             else:
-                decoder = "avdec_h264"
+                decoder = "avdec_h264 output-corrupt=false"
     else:
         # decodebin may pick a hardware accelerated decoder, which isn't ideal
         # so use a known software decoder for h264 and decodebin for anything else.
@@ -361,16 +366,20 @@ async def generateVideoFramesGstreamer(
     if fps:
         videorate = f"! videorate max-rate={fps}"
 
+    queue = "! queue leaky=downstream max-size-buffers=0"
+    if options and options.get('firstFrameOnly'):
+        queue = ""
+
     if postProcessPipeline == "VAAPI":
         pipeline += (
-            f" ! {decoder} {videorate} ! queue leaky=downstream max-size-buffers=0"
+            f" ! {decoder} {videorate} {queue}"
         )
     elif postProcessPipeline == "OpenGL (GPU memory)":
-        pipeline += f" ! {decoder} {videorate} ! queue leaky=downstream max-size-buffers=0 ! glupload"
+        pipeline += f" ! {decoder} {videorate} {queue} ! glupload"
     elif postProcessPipeline == "OpenGL (system memory)":
-        pipeline += f" ! {decoder} {videorate} ! queue leaky=downstream max-size-buffers=0 ! video/x-raw ! glupload"
+        pipeline += f" ! {decoder} {videorate} {queue} ! video/x-raw ! glupload"
     else:
-        pipeline += f" ! {decoder} ! video/x-raw {videorate} ! queue leaky=downstream max-size-buffers=0"
+        pipeline += f" ! {decoder} ! video/x-raw {videorate} {queue}"
         # disable the gstreamer post process because videocrop spams the log
         postProcessPipeline = "Default"
         # postProcessPipeline = None

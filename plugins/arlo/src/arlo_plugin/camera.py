@@ -5,18 +5,19 @@ import aiohttp
 from async_timeout import timeout as async_timeout
 from datetime import datetime, timedelta
 import json
-import threading
+import socket
 import time
+import threading
 from typing import List, TYPE_CHECKING
 
 import scrypted_arlo_go
 
 import scrypted_sdk
-from scrypted_sdk.types import Setting, Settings, SettingValue, Device, Camera, VideoCamera, VideoClips, VideoClip, VideoClipOptions, MotionSensor, AudioSensor, Battery, Charger, ChargeState, DeviceProvider, MediaObject, ResponsePictureOptions, ResponseMediaStreamOptions, ScryptedMimeTypes, ScryptedInterface, ScryptedDeviceType
+from scrypted_sdk.types import Setting, Settings, SettingValue, Device, Camera, VideoCamera, RequestMediaStreamOptions, VideoClips, VideoClip, VideoClipOptions, MotionSensor, AudioSensor, Battery, Charger, ChargeState, DeviceProvider, MediaObject, ResponsePictureOptions, ResponseMediaStreamOptions, ScryptedMimeTypes, ScryptedInterface, ScryptedDeviceType
 
-from .debug import EXPERIMENTAL
+from .arlo.arlo_async import USER_AGENTS
 from .base import ArloDeviceBase
-from .spotlight import ArloSpotlight, ArloFloodlight
+from .spotlight import ArloSpotlight, ArloFloodlight, ArloNightlight
 from .vss import ArloSirenVirtualSecuritySystem
 from .child_process import HeartbeatChildProcess
 from .util import BackgroundTaskMixin, async_print_exception_guard
@@ -26,13 +27,30 @@ if TYPE_CHECKING:
     from .provider import ArloProvider
 
 
+class ArloCameraIntercomSession(BackgroundTaskMixin):
+    def __init__(self, camera: ArloCamera) -> None:
+        super().__init__()
+        self.camera = camera
+        self.logger = camera.logger
+        self.provider = camera.provider
+        self.arlo_device = camera.arlo_device
+        self.arlo_basestation = camera.arlo_basestation
+
+    async def initialize_push_to_talk(self, media: MediaObject) -> None:
+        raise NotImplementedError("not implemented")
+
+    async def shutdown(self) -> None:
+        raise NotImplementedError("not implemented")
+
+
 class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, VideoClips, MotionSensor, AudioSensor, Battery, Charger):
     MODELS_WITH_SPOTLIGHTS = [
-        "vmc4040p",
         "vmc2030",
         "vmc2032",
+        "vmc4040p",
         "vmc4041p",
         "vmc4050p",
+        "vmc4060p",
         "vmc5040",
         "vml2030",
         "vml4030",
@@ -40,60 +58,85 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
 
     MODELS_WITH_FLOODLIGHTS = ["fb1001"]
 
+    MODELS_WITH_NIGHTLIGHTS = [
+        "abc1000",
+        "abc1000a",
+    ]
+
     MODELS_WITH_SIRENS = [
-        "vmc4040p",
         "fb1001",
-        "vmc2030",
         "vmc2020",
+        "vmc2030",
         "vmc2032",
+        "vmc4030",
+        "vmc4030p",
+        "vmc4040p",
         "vmc4041p",
         "vmc4050p",
+        "vmc4060p",
         "vmc5040",
         "vml2030",
-        "vmc4030",
         "vml4030",
-        "vmc4030p",
     ]
 
     MODELS_WITH_AUDIO_SENSORS = [
-        "vmc4040p",
+        "abc1000",
+        "abc1000a",
         "fb1001",
-        "vmc4041p",
-        "vmc4050p",
-        "vmc5040",
         "vmc3040",
         "vmc3040s",
         "vmc4030",
-        "vml4030",
         "vmc4030p",
+        "vmc4040p",
+        "vmc4041p",
+        "vmc4050p",
+        "vmc5040",
+        "vml4030",
     ]
 
     MODELS_WITHOUT_BATTERY = [
         "avd1001",
+        "vmc2040",
         "vmc3040",
         "vmc3040s",
     ]
 
     timeout: int = 30
-    intercom_session = None
+    intercom_session: ArloCameraIntercomSession = None
     light: ArloSpotlight = None
     vss: ArloSirenVirtualSecuritySystem = None
-    picture_lock: asyncio.Lock = None
 
     # eco mode bookkeeping
+    picture_lock: asyncio.Lock = None
     last_picture: bytes = None
     last_picture_time: datetime = datetime(1970, 1, 1)
+
+    # socket logger
+    logger_loop: asyncio.AbstractEventLoop = None
+    logger_server: asyncio.AbstractServer = None
+    logger_server_port: int = 0
 
     def __init__(self, nativeId: str, arlo_device: dict, arlo_basestation: dict, provider: ArloProvider) -> None:
         super().__init__(nativeId=nativeId, arlo_device=arlo_device, arlo_basestation=arlo_basestation, provider=provider)
         self.picture_lock = asyncio.Lock()
 
+        self.start_error_subscription()
         self.start_motion_subscription()
         self.start_audio_subscription()
         self.start_battery_subscription()
         self.create_task(self.delayed_init())
 
+    def __del__(self) -> None:
+        super().__del__()
+        def logger_exit_callback():
+            self.logger_server.close()
+            self.logger_loop.stop()
+            self.logger_loop.close()
+        self.logger_loop.call_soon_threadsafe(logger_exit_callback)
+
     async def delayed_init(self) -> None:
+        await self.create_tcp_logger_server()
+
         if not self.has_battery:
             return
 
@@ -111,13 +154,59 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
                 await asyncio.sleep(0.1)
             iterations += 1
 
+    @async_print_exception_guard
+    async def create_tcp_logger_server(self) -> None:
+        self.logger_loop = asyncio.new_event_loop()
+
+        def thread_main():
+            asyncio.set_event_loop(self.logger_loop)
+            self.logger_loop.run_forever()
+
+        threading.Thread(target=thread_main).start()
+
+        # this is a bit convoluted since we need the async functions to run in the
+        # logger loop thread instead of in the current thread
+        def setup_callback():
+            async def callback(reader, writer):
+                try:
+                    while not reader.at_eof():
+                        line = await reader.readline()
+                        if not line:
+                            break
+                        line = str(line, 'utf-8')
+                        line = line.rstrip()
+                        self.logger.info(line)
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    self.logger.exception("Logger server callback raised an exception")
+
+            async def setup():
+                self.logger_server = await asyncio.start_server(callback, host='localhost', port=0, family=socket.AF_INET, flags=socket.SOCK_STREAM)
+                self.logger_server_port = self.logger_server.sockets[0].getsockname()[1]
+                self.logger.info(f"Started logging server at localhost:{self.logger_server_port}")
+
+            self.logger_loop.create_task(setup())
+
+        self.logger_loop.call_soon_threadsafe(setup_callback)
+
+
+    def start_error_subscription(self) -> None:
+        def callback(code, message):
+            self.logger.error(f"Arlo returned error code {code} with message: {message}")
+            return self.stop_subscriptions
+
+        self.register_task(
+            self.provider.arlo.SubscribeToErrorEvents(self.arlo_basestation, self.arlo_device, callback)
+        )
+
     def start_motion_subscription(self) -> None:
         def callback(motionDetected):
             self.motionDetected = motionDetected
             return self.stop_subscriptions
 
         self.register_task(
-            self.provider.arlo.SubscribeToMotionEvents(self.arlo_basestation, self.arlo_device, callback)
+            self.provider.arlo.SubscribeToMotionEvents(self.arlo_basestation, self.arlo_device, callback, self.logger)
         )
 
     def start_audio_subscription(self) -> None:
@@ -129,7 +218,7 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
             return self.stop_subscriptions
 
         self.register_task(
-            self.provider.arlo.SubscribeToAudioEvents(self.arlo_basestation, self.arlo_device, callback)
+            self.provider.arlo.SubscribeToAudioEvents(self.arlo_basestation, self.arlo_device, callback, self.logger)
         )
 
     def start_battery_subscription(self) -> None:
@@ -152,14 +241,8 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
             ScryptedInterface.Settings.value,
         ])
 
-        if EXPERIMENTAL:
-            if self.two_way_audio:
-                results.discard(ScryptedInterface.RTCSignalingChannel.value)
-                results.add(ScryptedInterface.Intercom.value)
-
-            if self.webrtc_emulation:
-                results.add(ScryptedInterface.RTCSignalingChannel.value)
-                results.discard(ScryptedInterface.Intercom.value)
+        if self.has_push_to_talk:
+            results.add(ScryptedInterface.Intercom.value)
 
         if self.has_battery:
             results.add(ScryptedInterface.Battery.value)
@@ -174,11 +257,6 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
         if self.has_cloud_recording:
             results.add(ScryptedInterface.VideoClips.value)
 
-        if EXPERIMENTAL:
-            if not self._can_push_to_talk():
-                results.discard(ScryptedInterface.RTCSignalingChannel.value)
-                results.discard(ScryptedInterface.Intercom.value)
-
         return list(results)
 
     def get_device_type(self) -> str:
@@ -186,8 +264,8 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
 
     def get_builtin_child_device_manifests(self) -> List[Device]:
         results = []
-        if self.has_spotlight or self.has_floodlight:
-            light = self.get_or_create_spotlight_or_floodlight()
+        if self.has_spotlight or self.has_floodlight or self.has_nightlight:
+            light = self.get_or_create_light()
             results.append({
                 "info": {
                     "model": f"{self.arlo_device['modelId']} {self.arlo_device['properties'].get('hwVersion', '')}".strip(),
@@ -196,7 +274,7 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
                     "serialNumber": self.arlo_device["deviceId"],
                 },
                 "nativeId": light.nativeId,
-                "name": f'{self.arlo_device["deviceName"]} {"Spotlight" if self.has_spotlight else "Floodlight"}',
+                "name": f'{self.arlo_device["deviceName"]} {"Spotlight" if self.has_spotlight else "Floodlight" if self.has_floodlight else "Nightlight"}',
                 "interfaces": light.get_applicable_interfaces(),
                 "type": light.get_device_type(),
                 "providerNativeId": self.nativeId,
@@ -221,23 +299,6 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
         return results
 
     @property
-    def webrtc_emulation(self) -> bool:
-        if self.storage:
-            return True if self.storage.getItem("webrtc_emulation") else False
-        else:
-            return False
-
-    @property
-    def two_way_audio(self) -> bool:
-        if self.storage:
-            val = self.storage.getItem("two_way_audio")
-            if val is None:
-                val = True
-            return val
-        else:
-            return True
-
-    @property
     def wired_to_power(self) -> bool:
         if self.storage:
             return True if self.storage.getItem("wired_to_power") else False
@@ -252,7 +313,7 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
             return False
 
     @property
-    def snapshot_throttle_interval(self) -> bool:
+    def snapshot_throttle_interval(self) -> int:
         interval = self.storage.getItem("snapshot_throttle_interval")
         if interval is None:
             interval = 60
@@ -272,6 +333,10 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
         return any([self.arlo_device["modelId"].lower().startswith(model) for model in ArloCamera.MODELS_WITH_FLOODLIGHTS])
 
     @property
+    def has_nightlight(self) -> bool:
+        return any([self.arlo_device["modelId"].lower().startswith(model) for model in ArloCamera.MODELS_WITH_NIGHTLIGHTS])
+
+    @property
     def has_siren(self) -> bool:
         return any([self.arlo_device["modelId"].lower().startswith(model) for model in ArloCamera.MODELS_WITH_SIRENS])
 
@@ -282,6 +347,14 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
     @property
     def has_battery(self) -> bool:
         return not any([self.arlo_device["modelId"].lower().startswith(model) for model in ArloCamera.MODELS_WITHOUT_BATTERY])
+
+    @property
+    def has_push_to_talk(self) -> bool:
+        return bool(self.arlo_capabilities.get("Capabilities", {}).get("PushToTalk", {}).get("fullDuplex"))
+
+    @property
+    def uses_sip_push_to_talk(self) -> bool:
+        return "sip" in self.arlo_capabilities.get("Capabilities", {}).get("PushToTalk", {}).get("signal", [])
 
     async def getSettings(self) -> List[Setting]:
         result = []
@@ -323,26 +396,15 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
                     "type": "number",
                 }
             )
-        if self._can_push_to_talk() and EXPERIMENTAL:
-            result.extend([
-                {
-                    "group": "General",
-                    "key": "two_way_audio",
-                    "title": "(Experimental) Enable native two-way audio",
-                    "value": self.two_way_audio,
-                    "description": "Enables two-way audio for this device. Not yet completely functional on all audio senders.",
-                    "type": "boolean",
-                },
-                {
-                    "group": "General",
-                    "key": "webrtc_emulation",
-                    "title": "(Highly Experimental) Emulate WebRTC Camera",
-                    "value": self.webrtc_emulation,
-                    "description": "Configures the plugin to offer this device as a WebRTC camera, merging video/audio stream with two-way audio. "
-                                   "If enabled, takes precedence over native two-way audio. May use increased system resources.",
-                    "type": "boolean",
-                },
-            ])
+        result.append(
+            {
+                "group": "General",
+                "key": "print_debug",
+                "title": "Debug Info",
+                "description": "Prints information about this device to console.",
+                "type": "button",
+            }
+        )
         return result
 
     @async_print_exception_guard
@@ -351,11 +413,13 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
             await self.onDeviceEvent(ScryptedInterface.Settings.value, None)
             return
 
-        if key in ["webrtc_emulation", "two_way_audio", "wired_to_power"]:
+        if key in ["wired_to_power"]:
             self.storage.setItem(key, value == "true" or value == True)
             await self.provider.discover_devices()
         elif key in ["eco_mode"]:
             self.storage.setItem(key, value == "true" or value == True)
+        elif key == "print_debug":
+            self.logger.info(f"Device Capabilities: {self.arlo_capabilities}")
         else:
             self.storage.setItem(key, value)
         await self.onDeviceEvent(ScryptedInterface.Settings.value, None)
@@ -396,7 +460,7 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
             self.logger.debug(f"Got snapshot URL for at {pic_url}")
 
             if pic_url is None:
-                raise Exception("Error taking snapshot")
+                raise Exception("Error taking snapshot: no url returned")
 
             async with async_timeout(self.timeout):
                 async with aiohttp.ClientSession() as session:
@@ -408,8 +472,8 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
 
             return await scrypted_sdk.mediaManager.createMediaObject(self.last_picture, "image/jpeg")
 
-    async def getVideoStreamOptions(self) -> List[ResponseMediaStreamOptions]:
-        return [
+    async def getVideoStreamOptions(self, id: str = None) -> List[ResponseMediaStreamOptions]:
+        options = [
             {
                 "id": 'default',
                 "name": 'Cloud RTSP',
@@ -423,72 +487,85 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
                 "source": 'cloud',
                 "tool": 'scrypted',
                 "userConfigurable": False,
+            },
+            {
+                "id": 'dash',
+                "name": 'Cloud DASH',
+                "container": 'dash',
+                "video": {
+                    "codec": 'unknown',
+                },
+                "audio": None if self.arlo_device.get("modelId") == "VMC3030" else {
+                    "codec": 'unknown',
+                },
+                "source": 'cloud',
+                "tool": 'ffmpeg',
+                "userConfigurable": False,
             }
         ]
 
-    async def _getVideoStreamURL(self) -> str:
-        self.logger.info("Requesting stream")
-        rtsp_url = await asyncio.wait_for(self.provider.arlo.StartStream(self.arlo_basestation, self.arlo_device), timeout=self.timeout)
-        self.logger.debug(f"Got stream URL at {rtsp_url}")
-        return rtsp_url
+        if id is None:
+            return options
 
-    async def getVideoStream(self, options: dict = None) -> MediaObject:
+        return next(iter([o for o in options if o['id'] == id]))
+
+    async def _getVideoStreamURL(self, container: str) -> str:
+        self.logger.info(f"Requesting {container} stream")
+        url = await asyncio.wait_for(self.provider.arlo.StartStream(self.arlo_basestation, self.arlo_device, mode=container), timeout=self.timeout)
+        self.logger.debug(f"Got {container} stream URL at {url}")
+        return url
+
+    @async_print_exception_guard
+    async def getVideoStream(self, options: RequestMediaStreamOptions = {}) -> MediaObject:
         self.logger.debug("Entered getVideoStream")
-        rtsp_url = await self._getVideoStreamURL()
 
-        mso = (await self.getVideoStreamOptions())[0]
+        mso = await self.getVideoStreamOptions(id=options.get("id", "default"))
         mso['refreshAt'] = round(time.time() * 1000) + 30 * 60 * 1000
+        container = mso["container"]
+
+        url = await self._getVideoStreamURL(container)
+        additional_ffmpeg_args = []
+
+        if container == "dash":
+            headers = self.provider.arlo.GetMPDHeaders(url)
+            ffmpeg_headers = '\r\n'.join([
+                f'{k}: {v}'
+                for k, v in headers.items()
+            ])
+            additional_ffmpeg_args = ['-headers', ffmpeg_headers+'\r\n']
 
         ffmpeg_input = {
-            'url': rtsp_url,
-            'container': 'rtsp',
+            'url': url,
+            'container': container,
             'mediaStreamOptions': mso,
             'inputArguments': [
-                '-f', 'rtsp',
-                '-i', rtsp_url,
+                '-f', container,
+                *additional_ffmpeg_args,
+                '-i', url,
             ]
         }
         return await scrypted_sdk.mediaManager.createFFmpegMediaObject(ffmpeg_input)
 
     @async_print_exception_guard
-    async def startRTCSignalingSession(self, scrypted_session):
-        plugin_session = ArloCameraRTCSignalingSession(self)
-        await plugin_session.initialize()
-
-        scrypted_setup = {
-            "type": "offer",
-            "audio": {
-                "direction": "sendrecv" if self._can_push_to_talk() else "recvonly",
-            },
-            "video": {
-                "direction": "recvonly",
-            }
-        }
-        plugin_setup = {}
-
-        scrypted_offer = await scrypted_session.createLocalDescription("offer", scrypted_setup, sendIceCandidate=plugin_session.addIceCandidate)
-        self.logger.info(f"Scrypted offer sdp:\n{scrypted_offer['sdp']}")
-        await plugin_session.setRemoteDescription(scrypted_offer, plugin_setup)
-        plugin_answer = await plugin_session.createLocalDescription("answer", plugin_setup, scrypted_session.sendIceCandidate)
-        self.logger.info(f"Scrypted answer sdp:\n{plugin_answer['sdp']}")
-        await scrypted_session.setRemoteDescription(plugin_answer, scrypted_setup)
-
-        return ArloCameraRTCSessionControl(plugin_session)
-
-    async def startIntercom(self, media) -> None:
+    async def startIntercom(self, media: MediaObject) -> None:
         self.logger.info("Starting intercom")
-        self.intercom_session = ArloCameraRTCSignalingSession(self)
+
+        if self.uses_sip_push_to_talk:
+            # signaling happens over sip
+            self.intercom_session = ArloCameraSIPIntercomSession(self)
+        else:
+            # we need to do signaling through arlo cloud apis
+            self.intercom_session = ArloCameraWebRTCIntercomSession(self)
         await self.intercom_session.initialize_push_to_talk(media)
 
+        self.logger.info("Intercom initialized")
+
+    @async_print_exception_guard
     async def stopIntercom(self) -> None:
         self.logger.info("Stopping intercom")
         if self.intercom_session is not None:
             await self.intercom_session.shutdown()
             self.intercom_session = None
-
-    def _can_push_to_talk(self) -> bool:
-        # Right now, only implement push to talk for basestation cameras
-        return self.arlo_device["deviceId"] != self.arlo_device["parentId"]
 
     async def getVideoClip(self, videoId: str) -> MediaObject:
         self.logger.info(f"Getting video clip {videoId}")
@@ -551,17 +628,17 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
 
     @async_print_exception_guard
     async def removeVideoClips(self, videoClipIds: List[str]) -> None:
-        # Arlo does support deleting, but let's be safe and disable that
-        raise Exception("deleting Arlo video clips is not implemented by this plugin")
+        # Arlo Cloud does support deleting, but let's be safe and not expose that here
+        raise Exception("deleting Arlo video clips is not implemented by this plugin - please delete clips through the Arlo app")
 
     async def getDevice(self, nativeId: str) -> ArloDeviceBase:
-        if (nativeId.endswith("spotlight") and self.has_spotlight) or (nativeId.endswith("floodlight") and self.has_floodlight):
-            return self.get_or_create_spotlight_or_floodlight()
+        if (nativeId.endswith("spotlight") and self.has_spotlight) or (nativeId.endswith("floodlight") and self.has_floodlight) or (nativeId.endswith("nightlight") and self.has_nightlight):
+            return self.get_or_create_light()
         if nativeId.endswith("vss") and self.has_siren:
             return self.get_or_create_vss()
         return None
 
-    def get_or_create_spotlight_or_floodlight(self) -> ArloSpotlight:
+    def get_or_create_light(self) -> ArloSpotlight:
         if self.has_spotlight:
             light_id = f'{self.arlo_device["deviceId"]}.spotlight'
             if not self.light:
@@ -570,6 +647,10 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
             light_id = f'{self.arlo_device["deviceId"]}.floodlight'
             if not self.light:
                 self.light = ArloFloodlight(light_id, self.arlo_device, self.arlo_basestation, self.provider, self)
+        elif self.has_nightlight:
+            light_id = f'{self.arlo_device["deviceId"]}.nightlight'
+            if not self.light:
+                self.light = ArloNightlight(light_id, self.arlo_device, self.provider, self)
         return self.light
 
     def get_or_create_vss(self) -> ArloSirenVirtualSecuritySystem:
@@ -580,31 +661,24 @@ class ArloCamera(ArloDeviceBase, Settings, Camera, VideoCamera, DeviceProvider, 
         return self.vss
 
 
-class ArloCameraRTCSignalingSession(BackgroundTaskMixin):
-    def __init__(self, camera):
-        super().__init__()
-        self.camera = camera
-        self.logger = camera.logger
-        self.provider = camera.provider
-        self.arlo_device = camera.arlo_device
-        self.arlo_basestation = camera.arlo_basestation
+class ArloCameraWebRTCIntercomSession(ArloCameraIntercomSession):
+    def __init__(self, camera: ArloCamera) -> None:
+        super().__init__(camera)
 
-        self.ffmpeg_subprocess = None
-        self.intercom_ffmpeg_subprocess = None
-
-        self.scrypted_pc = None
         self.arlo_pc = None
         self.arlo_sdp_answered = False
+
+        self.intercom_ffmpeg_subprocess = None
 
         self.stop_subscriptions = False
         self.start_sdp_answer_subscription()
         self.start_candidate_answer_subscription()
 
-    def __del__(self):
+    def __del__(self) -> None:
         self.stop_subscriptions = True
         self.cancel_pending_tasks()
 
-    def start_sdp_answer_subscription(self):
+    def start_sdp_answer_subscription(self) -> None:
         def callback(sdp):
             if self.arlo_pc and not self.arlo_sdp_answered:
                 if "a=mid:" not in sdp:
@@ -622,7 +696,7 @@ class ArloCameraRTCSignalingSession(BackgroundTaskMixin):
             self.provider.arlo.SubscribeToSDPAnswers(self.arlo_basestation, self.arlo_device, callback)
         )
 
-    def start_candidate_answer_subscription(self):
+    def start_candidate_answer_subscription(self) -> None:
         def callback(candidate):
             if self.arlo_pc:
                 prefix = "a=candidate:"
@@ -639,24 +713,27 @@ class ArloCameraRTCSignalingSession(BackgroundTaskMixin):
             self.provider.arlo.SubscribeToCandidateAnswers(self.arlo_basestation, self.arlo_device, callback)
         )
 
-    async def initialize(self):
-        self.logger.info("Initializing video stream for RTC")
-        rtsp_url = await self.camera._getVideoStreamURL()
+    @async_print_exception_guard
+    async def initialize_push_to_talk(self, media: MediaObject) -> None:
+        self.logger.info("Initializing push to talk")
 
-        cfg = scrypted_arlo_go.WebRTCConfiguration(
-            ICEServers=scrypted_arlo_go.Slice_webrtc_ICEServer([
-                scrypted_arlo_go.NewWebRTCICEServer(
-                    scrypted_arlo_go.go.Slice_string(["turn:turn0.clockworkmod.com", "turn:n0.clockworkmod.com", "turn:n1.clockworkmod.com"]),
-                    "foo",
-                    "bar"
-                )
-            ])
-        )
-        cfg = scrypted_arlo_go.WebRTCConfiguration()
-        self.scrypted_pc = scrypted_arlo_go.NewWebRTCManager("Arlo "+self.camera.logger_name, cfg)
+        session_id, ice_servers = self.provider.arlo.StartPushToTalk(self.arlo_basestation, self.arlo_device)
+        self.logger.debug(f"Received ice servers: {[ice['url'] for ice in ice_servers]}")
 
-        audio_port = self.scrypted_pc.InitializeAudioRTPListener(scrypted_arlo_go.WebRTCMimeTypeOpus)
-        video_port = self.scrypted_pc.InitializeVideoRTPListener(scrypted_arlo_go.WebRTCMimeTypeH264)
+        ice_servers = scrypted_arlo_go.Slice_webrtc_ICEServer([
+            scrypted_arlo_go.NewWebRTCICEServer(
+                scrypted_arlo_go.go.Slice_string([ice['url']]),
+                ice.get('username', ''),
+                ice.get('credential', '')
+            )
+            for ice in ice_servers
+        ])
+
+        self.arlo_pc = scrypted_arlo_go.NewWebRTCManager(self.camera.logger_server_port, ice_servers)
+
+        ffmpeg_params = json.loads(await scrypted_sdk.mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput.value))
+        self.logger.debug(f"Received ffmpeg params: {ffmpeg_params}")
+        audio_port = self.arlo_pc.InitializeAudioRTPListener(scrypted_arlo_go.WebRTCMimeTypeOpus)
 
         ffmpeg_path = await scrypted_sdk.mediaManager.getFFmpegPath()
         ffmpeg_args = [
@@ -665,200 +742,163 @@ class ArloCameraRTCSignalingSession(BackgroundTaskMixin):
             "-loglevel", "error",
             "-analyzeduration", "0",
             "-fflags", "-nobuffer",
-            "-max_probe_packets", "2",
-            "-vcodec", "h264",
-            "-acodec", "aac",
-            "-i", rtsp_url,
-            "-an",
-            "-vcodec", "copy",
-            "-f", "rtp",
-            "-flush_packets", "1",
-            f"rtp://localhost:{video_port}",
-            "-vn",
+            "-probesize", "500000",
+            *ffmpeg_params["inputArguments"],
             "-acodec", "libopus",
+            "-flags", "+global_header",
+            "-vbr", "off",
+            "-ar", "48k",
+            "-b:a", "32k",
+            "-bufsize", "96k",
+            "-ac", "2",
+            "-application", "lowdelay",
+            "-dn", "-sn", "-vn",
+            "-frame_duration", "20",
             "-f", "rtp",
             "-flush_packets", "1",
             f"rtp://localhost:{audio_port}?pkt_size={scrypted_arlo_go.UDP_PACKET_SIZE()}",
         ]
-        self.logger.debug(f"Starting ffmpeg at {ffmpeg_path} with {ffmpeg_args}")
+        self.logger.debug(f"Starting ffmpeg at {ffmpeg_path} with '{' '.join(ffmpeg_args)}'")
 
-        self.ffmpeg_subprocess = HeartbeatChildProcess("Arlo "+self.camera.logger_name, ffmpeg_path, *ffmpeg_args)
-        self.ffmpeg_subprocess.start()
+        self.intercom_ffmpeg_subprocess = HeartbeatChildProcess("FFmpeg", self.camera.logger_server_port, ffmpeg_path, *ffmpeg_args)
+        self.intercom_ffmpeg_subprocess.start()
 
-        if self.camera._can_push_to_talk():
-            self.create_task(self.initialize_push_to_talk())
+        self.sdp_answered = False
 
-    async def initialize_push_to_talk(self, media=None):
-        try:
-            self.logger.info("Initializing push to talk")
+        offer = self.arlo_pc.CreateOffer()
+        offer_sdp = scrypted_arlo_go.WebRTCSessionDescriptionSDP(offer)
+        self.logger.info(f"Arlo offer sdp:\n{offer_sdp}")
 
-            session_id, ice_servers = self.provider.arlo.StartPushToTalk(self.arlo_basestation, self.arlo_device)
-            self.logger.debug(f"Received ice servers: {[ice['url'] for ice in ice_servers]}")
+        self.arlo_pc.SetLocalDescription(offer)
 
-            cfg = scrypted_arlo_go.WebRTCConfiguration(
-                ICEServers=scrypted_arlo_go.Slice_webrtc_ICEServer([
-                    scrypted_arlo_go.NewWebRTCICEServer(
-                        scrypted_arlo_go.go.Slice_string([ice['url']]),
-                        ice.get('username', ''),
-                        ice.get('credential', '')
+        self.provider.arlo.NotifyPushToTalkSDP(
+            self.arlo_basestation, self.arlo_device,
+            session_id, offer_sdp
+        )
+
+        def trickle_candidates():
+            count = 0
+            try:
+                while True:
+                    candidate = self.arlo_pc.GetNextICECandidate()
+                    candidate = scrypted_arlo_go.WebRTCICECandidateInit(
+                        scrypted_arlo_go.WebRTCICECandidate(handle=candidate.handle).ToJSON()
+                    ).Candidate
+                    self.logger.debug(f"Sending candidate to Arlo: {candidate}")
+                    self.provider.arlo.NotifyPushToTalkCandidate(
+                        self.arlo_basestation, self.arlo_device,
+                        session_id, candidate,
                     )
-                    for ice in ice_servers
-                ])
-            )
-            self.arlo_pc = scrypted_arlo_go.NewWebRTCManager("Arlo "+self.camera.logger_name, cfg)
+                    count += 1
+            except RuntimeError as e:
+                if str(e) == "no more candidates":
+                    self.logger.debug(f"End of candidates, found {count} candidate(s)")
+                else:
+                    self.logger.exception("Exception while processing trickle candidates")
+            except Exception:
+                self.logger.exception("Exception while processing trickle candidates")
 
-            if media is not None:
-                ffmpeg_params = json.loads(await scrypted_sdk.mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput.value))
-                self.logger.debug(f"Received ffmpeg params: {ffmpeg_params}")
-                audio_port = self.arlo_pc.InitializeAudioRTPListener(scrypted_arlo_go.WebRTCMimeTypeOpus)
+        # we can trickle candidates asynchronously so the caller to startIntercom
+        # knows we are ready to receive packets
+        threading.Thread(target=trickle_candidates).start()
 
-                ffmpeg_path = await scrypted_sdk.mediaManager.getFFmpegPath()
-                ffmpeg_args = [
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-analyzeduration", "0",
-                    "-fflags", "-nobuffer",
-                    "-probesize", "500000",
-                    *ffmpeg_params["inputArguments"],
-                    "-vn",
-                    "-acodec", "libopus",
-                    "-f", "rtp",
-                    "-flush_packets", "1",
-                    f"rtp://localhost:{audio_port}?pkt_size={scrypted_arlo_go.UDP_PACKET_SIZE()}",
-                ]
-                self.logger.debug(f"Starting ffmpeg at {ffmpeg_path} with {ffmpeg_args}")
-
-                self.intercom_ffmpeg_subprocess = HeartbeatChildProcess("Arlo "+self.camera.logger_name, ffmpeg_path, *ffmpeg_args)
-                self.intercom_ffmpeg_subprocess.start()
-            else:
-                self.logger.debug("Starting audio track forwarder")
-                self.scrypted_pc.ForwardAudioTo(self.arlo_pc)
-                self.logger.debug("Started audio track forwarder")
-
-            self.sdp_answered = False
-
-            offer = self.arlo_pc.CreateOffer()
-            offer_sdp = scrypted_arlo_go.WebRTCSessionDescriptionSDP(offer)
-            self.logger.info(f"Arlo offer sdp:\n{offer_sdp}")
-
-            self.arlo_pc.SetLocalDescription(offer)
-
-            self.provider.arlo.NotifyPushToTalkSDP(
-                self.arlo_basestation, self.arlo_device,
-                session_id, offer_sdp
-            )
-
-            def forward_candidates():
-                try:
-                    candidates = self.arlo_pc.WaitAndGetICECandidates()
-                    self.logger.debug(f"Gathered {len(candidates)} candidates")
-                    for candidate in candidates:
-                        candidate = scrypted_arlo_go.WebRTCICECandidateInit(
-                            scrypted_arlo_go.WebRTCICECandidate(handle=candidate).ToJSON()
-                        ).Candidate
-                        self.logger.debug(f"Sending candidate to Arlo: {candidate}")
-                        self.provider.arlo.NotifyPushToTalkCandidate(
-                            self.arlo_basestation, self.arlo_device,
-                            session_id, candidate,
-                        )
-                except Exception as e:
-                    self.logger.error(e)
-            t = threading.Thread(target=forward_candidates)
-            t.start()
-        except Exception as e:
-            self.logger.error(e)
-
-    async def createLocalDescription(self, type, setup, sendIceCandidate=None):
-        if type == "offer":
-            raise Exception("can only create answers in ArloCameraRTCSignalingSession.createLocalDescription")
-
-        answer = self.scrypted_pc.CreateAnswer()
-        answer_sdp = scrypted_arlo_go.WebRTCSessionDescriptionSDP(answer)
-
-        self.scrypted_pc.SetLocalDescription(answer)
-
-        if sendIceCandidate is not None:
-            loop = asyncio.get_event_loop()
-            def forward_candidates():
-                try:
-                    candidates = self.scrypted_pc.WaitAndGetICECandidates()
-                    self.logger.debug(f"Gathered {len(candidates)} candidates")
-                    for candidate in candidates:
-                        candidate = scrypted_arlo_go.WebRTCICECandidateInit(
-                            scrypted_arlo_go.WebRTCICECandidate(handle=candidate).ToJSON()
-                        ).Candidate
-                        self.logger.debug(f"Sending candidate to scrypted: {candidate}")
-                        loop.call_soon_threadsafe(
-                            self.create_task,
-                            sendIceCandidate({
-                                "candidate": candidate,
-                                "sdpMid": "0",
-                                "sdpMLineIndex": 0,
-                            })
-                        )
-                except Exception as e:
-                    self.logger.error(e)
-            t = threading.Thread(target=forward_candidates)
-            t.start()
-
-        return {
-            "sdp": answer_sdp,
-            "type": "answer"
-        }
-
-    async def setRemoteDescription(self, description, setup):
-        if description["type"] != "offer":
-            raise Exception("can only accept offers in ArloCameraRTCSignalingSession.createLocalDescription")
-
-        sdp = scrypted_arlo_go.WebRTCSessionDescription(scrypted_arlo_go.NewWebRTCSDPType("offer"), description["sdp"])
-        self.scrypted_pc.SetRemoteDescription(sdp)
-
-    async def addIceCandidate(self, candidate):
-        candidate = scrypted_arlo_go.WebRTCICECandidateInit(candidate["candidate"], "0", 0)
-        self.scrypted_pc.AddICECandidate(candidate)
-
-    async def getOptions(self):
-        pass
-
-    async def unmute_relay(self):
-        return
-        await self.arlo_pc.unmute_relay(self.arlo_relay_track)
-
-    async def mute_relay(self):
-        return
-        await self.arlo_pc.mute_relay(self.arlo_relay_track)
-
-    async def shutdown(self):
-        if self.ffmpeg_subprocess is not None:
-            self.ffmpeg_subprocess.stop()
-            self.ffmpeg_subprocess = None
+    @async_print_exception_guard
+    async def shutdown(self) -> None:
         if self.intercom_ffmpeg_subprocess is not None:
             self.intercom_ffmpeg_subprocess.stop()
             self.intercom_ffmpeg_subprocess = None
-        if self.scrypted_pc is not None:
-            self.scrypted_pc.Close()
-            self.scrypted_pc = None
         if self.arlo_pc is not None:
             self.arlo_pc.Close()
             self.arlo_pc = None
 
 
-class ArloCameraRTCSessionControl:
-    def __init__(self, arlo_session):
-        self.arlo_session = arlo_session
-        self.logger = arlo_session.logger
+class ArloCameraSIPIntercomSession(ArloCameraIntercomSession):
+    def __init__(self, camera: ArloCamera) -> None:
+        super().__init__(camera)
 
-    async def setPlayback(self, options):
-        self.logger.debug(f"setPlayback options {options}")
-        audio = options.get("audio")
-        if audio is None:
-            return
-        if audio:
-            await self.arlo_session.unmute_relay()
-        else:
-            await self.arlo_session.mute_relay()
+        self.arlo_sip = None
+        self.intercom_ffmpeg_subprocess = None
 
-    async def endSession(self):
-        self.logger.info("Ending RTC session")
-        await self.arlo_session.shutdown()
+    @async_print_exception_guard
+    async def initialize_push_to_talk(self, media: MediaObject) -> None:
+        self.logger.info("Initializing push to talk")
+
+        sip_info = self.provider.arlo.GetSIPInfo()
+        sip_call_info = sip_info["sipCallInfo"]
+
+        # though GetSIPInfo returns ice servers, there doesn't seem to be any indication
+        # that they are used on the arlo web dashboard, so just use what Chrome inserts
+        ice_servers = [{"url": "stun:stun.l.google.com:19302"}]
+        self.logger.debug(f"Will use ice servers: {[ice['url'] for ice in ice_servers]}")
+
+        ice_servers = scrypted_arlo_go.Slice_webrtc_ICEServer([
+            scrypted_arlo_go.NewWebRTCICEServer(
+                scrypted_arlo_go.go.Slice_string([ice['url']]),
+                ice.get('username', ''),
+                ice.get('credential', '')
+            )
+            for ice in ice_servers
+        ])
+        sip_cfg = scrypted_arlo_go.SIPInfo(
+            DeviceID=self.camera.nativeId,
+            CallerURI=f"sip:{sip_call_info['id']}@{sip_call_info['domain']}:{sip_call_info['port']}",
+            CalleeURI=sip_call_info['calleeUri'],
+            Password=sip_call_info['password'],
+            UserAgent="SIP.js/0.20.1",
+            WebsocketURI="wss://livestream-z2-prod.arlo.com:7443",
+            WebsocketOrigin="https://my.arlo.com",
+            WebsocketHeaders=scrypted_arlo_go.HeadersMap({"User-Agent": USER_AGENTS["arlo"]}),
+        )
+
+        self.arlo_sip = scrypted_arlo_go.NewSIPWebRTCManager(self.camera.logger_server_port, ice_servers, sip_cfg)
+
+        ffmpeg_params = json.loads(await scrypted_sdk.mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput.value))
+        self.logger.debug(f"Received ffmpeg params: {ffmpeg_params}")
+        audio_port = self.arlo_sip.InitializeAudioRTPListener(scrypted_arlo_go.WebRTCMimeTypeOpus)
+
+        ffmpeg_path = await scrypted_sdk.mediaManager.getFFmpegPath()
+        ffmpeg_args = [
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-analyzeduration", "0",
+            "-fflags", "-nobuffer",
+            "-probesize", "500000",
+            *ffmpeg_params["inputArguments"],
+            "-acodec", "libopus",
+            "-flags", "+global_header",
+            "-vbr", "off",
+            "-ar", "48k",
+            "-b:a", "32k",
+            "-bufsize", "96k",
+            "-ac", "2",
+            "-application", "lowdelay",
+            "-dn", "-sn", "-vn",
+            "-frame_duration", "20",
+            "-f", "rtp",
+            "-flush_packets", "1",
+            f"rtp://localhost:{audio_port}?pkt_size={scrypted_arlo_go.UDP_PACKET_SIZE()}",
+        ]
+        self.logger.debug(f"Starting ffmpeg at {ffmpeg_path} with '{' '.join(ffmpeg_args)}'")
+
+        self.intercom_ffmpeg_subprocess = HeartbeatChildProcess("FFmpeg", self.camera.logger_server_port, ffmpeg_path, *ffmpeg_args)
+        self.intercom_ffmpeg_subprocess.start()
+
+        def sip_start():
+            try:
+                self.arlo_sip.Start()
+            except Exception:
+                self.logger.exception("Exception starting sip call")
+
+        # do remaining setup asynchronously so the caller to startIntercom
+        # can start sending packets
+        threading.Thread(target=sip_start).start()
+
+    @async_print_exception_guard
+    async def shutdown(self) -> None:
+        if self.intercom_ffmpeg_subprocess is not None:
+            self.intercom_ffmpeg_subprocess.stop()
+            self.intercom_ffmpeg_subprocess = None
+        if self.arlo_sip is not None:
+            self.arlo_sip.Close()
+            self.arlo_sip = None

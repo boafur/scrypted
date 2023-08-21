@@ -3,7 +3,8 @@
 set -x
 
 NODE_VERSION=18
-IMAGE_BASE=lunar
+SCRYPTED_INSTALL_VERSION=beta
+IMAGE_BASE=jammy
 FLAVOR=full
 BASE=$NODE_VERSION-$IMAGE_BASE-$FLAVOR
 echo $BASE
@@ -14,4 +15,4 @@ docker build -t koush/scrypted-common:$BASE -f Dockerfile.$FLAVOR \
     --build-arg NODE_VERSION=$NODE_VERSION --build-arg BASE=$IMAGE_BASE . && \
 \
 docker build -t koush/scrypted:$SUPERVISOR_BASE -f Dockerfile$SUPERVISOR \
-    --build-arg BASE=$BASE .
+    --build-arg BASE=$BASE --build-arg SCRYPTED_INSTALL_VERSION=$SCRYPTED_INSTALL_VERSION .

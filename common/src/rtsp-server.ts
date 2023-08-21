@@ -6,14 +6,14 @@ import { parseHTTPHeadersQuotedKeyValueSet } from 'http-auth-utils/dist/utils';
 import net from 'net';
 import { Duplex, Readable, Writable } from 'stream';
 import tls from 'tls';
+import { URL } from 'url';
 import { Deferred } from './deferred';
-import { closeQuiet, createBindUdp, createBindZero, listenZeroSingleClient } from './listen-cluster';
+import { closeQuiet, createBindZero, createSquentialBindZero, listenZeroSingleClient } from './listen-cluster';
 import { timeoutPromise } from './promise-utils';
 import { readLength, readLine } from './read-stream';
 import { MSection, parseSdp } from './sdp-utils';
 import { sleep } from './sleep';
 import { StreamChunk, StreamParser, StreamParserOptions } from './stream-parser';
-import { URL } from 'url';
 
 const REQUIRED_WWW_AUTHENTICATE_KEYS = ['realm', 'nonce'];
 
@@ -195,47 +195,16 @@ export function createRtspParser(options?: StreamParserOptions): RtspStreamParse
             '-f', 'rtsp',
         ],
         findSyncFrame(streamChunks: StreamChunk[]) {
-            let foundIndex: number;
-            let nonVideo: {
-                [codec: string]: StreamChunk,
-            } = {};
-
-            const createSyncFrame = () => {
-                const ret = streamChunks.slice(foundIndex);
-                // for (const nv of Object.values(nonVideo)) {
-                //     ret.unshift(nv);
-                // }
-                return ret;
-            }
-
             for (let prebufferIndex = 0; prebufferIndex < streamChunks.length; prebufferIndex++) {
                 const streamChunk = streamChunks[prebufferIndex];
                 if (streamChunk.type !== 'h264') {
-                    nonVideo[streamChunk.type] = streamChunk;
                     continue;
                 }
 
-                if (findH264NaluType(streamChunk, H264_NAL_TYPE_SPS))
-                    foundIndex = prebufferIndex;
-            }
-
-            if (foundIndex !== undefined)
-                return createSyncFrame();
-
-            nonVideo = {};
-            // some streams don't contain codec info, so find an idr frame instead.
-            for (let prebufferIndex = 0; prebufferIndex < streamChunks.length; prebufferIndex++) {
-                const streamChunk = streamChunks[prebufferIndex];
-                if (streamChunk.type !== 'h264') {
-                    nonVideo[streamChunk.type] = streamChunk;
-                    continue;
+                if (findH264NaluType(streamChunk, H264_NAL_TYPE_SPS) || findH264NaluType(streamChunk, H264_NAL_TYPE_IDR)) {
+                    return streamChunks.slice(prebufferIndex);
                 }
-                if (findH264NaluType(streamChunk, H264_NAL_TYPE_IDR))
-                    foundIndex = prebufferIndex;
             }
-
-            if (foundIndex !== undefined)
-                return createSyncFrame();
 
             // oh well!
         },
@@ -964,8 +933,7 @@ export class RtspServer {
             const match = transport.match(/.*?client_port=([0-9]+)-([0-9]+)/);
             const [_, rtp, rtcp] = match;
 
-            const rtpServer = await createBindZero();
-            const rtcpServer = await createBindUdp(rtpServer.port + 1);
+            const [rtpServer, rtcpServer] = await createSquentialBindZero();
             this.client.on('close', () => closeQuiet(rtpServer.server));
             this.client.on('close', () => closeQuiet(rtcpServer.server));
             this.setupTracks[msection.control] = {

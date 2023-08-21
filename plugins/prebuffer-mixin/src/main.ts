@@ -29,14 +29,6 @@ import { TRANSCODE_MIXIN_PROVIDER_NATIVE_ID, TranscodeMixinProvider, getTranscod
 const { mediaManager, log, systemManager, deviceManager } = sdk;
 
 const prebufferDurationMs = 10000;
-const DEFAULT_AUDIO = 'Default';
-const AAC_AUDIO = 'AAC or No Audio';
-const AAC_AUDIO_DESCRIPTION = `${AAC_AUDIO} (Copy)`;
-const COMPATIBLE_AUDIO = 'Compatible Audio'
-const COMPATIBLE_AUDIO_DESCRIPTION = `${COMPATIBLE_AUDIO} (Copy)`;
-const TRANSCODE_AUDIO = 'Other Audio';
-const TRANSCODE_AUDIO_DESCRIPTION = `${TRANSCODE_AUDIO} (Transcode)`;
-const COMPATIBLE_AUDIO_CODECS = ['aac', 'mp3', 'mp2', 'opus'];
 const DEFAULT_FFMPEG_INPUT_ARGUMENTS = '-fflags +genpts';
 
 const SCRYPTED_PARSER_TCP = 'Scrypted (TCP)';
@@ -44,12 +36,6 @@ const SCRYPTED_PARSER_UDP = 'Scrypted (UDP)';
 const FFMPEG_PARSER_TCP = 'FFmpeg (TCP)';
 const FFMPEG_PARSER_UDP = 'FFmpeg (UDP)';
 const STRING_DEFAULT = 'Default';
-
-const VALID_AUDIO_CONFIGS = [
-  AAC_AUDIO,
-  COMPATIBLE_AUDIO,
-  TRANSCODE_AUDIO,
-];
 
 interface PrebufferStreamChunk extends StreamChunk {
   time?: number;
@@ -198,7 +184,7 @@ class PrebufferSession {
   release() {
     this.clearPrebuffers();
     this.parserSessionPromise?.then(parserSession => {
-      this.console.log('prebuffer session released');
+      this.console.log(this.streamName, 'prebuffer session released');
       parserSession.kill(new Error('rebroadcast disabled'));
       this.clearPrebuffers();
     });
@@ -217,29 +203,14 @@ class PrebufferSession {
       return;
     this.console.log(this.streamName, 'prebuffer session started');
     this.parserSessionPromise = this.startPrebufferSession();
-    this.parserSessionPromise.catch(e => this.parserSessionPromise = undefined);
-    this.parserSessionPromise.then(pso => pso.killed.finally(() => this.parserSessionPromise = undefined));
-  }
-
-  getAudioConfig(): {
-    isUsingDefaultAudioConfig: boolean,
-    aacAudio: boolean,
-    compatibleAudio: boolean,
-    reencodeAudio: boolean,
-  } {
-    let audioConfig = this.storage.getItem(this.audioConfigurationKey) || '';
-    if (!VALID_AUDIO_CONFIGS.find(config => audioConfig.startsWith(config)))
-      audioConfig = '';
-    const aacAudio = audioConfig.indexOf(AAC_AUDIO) !== -1;
-    const compatibleAudio = audioConfig.indexOf(COMPATIBLE_AUDIO) !== -1;
-    // reencode audio will be used if explicitly set.
-    const reencodeAudio = audioConfig.indexOf(TRANSCODE_AUDIO) !== -1;
-    return {
-      isUsingDefaultAudioConfig: !(aacAudio || compatibleAudio || reencodeAudio),
-      aacAudio,
-      compatibleAudio,
-      reencodeAudio,
-    }
+    this.parserSessionPromise.catch(e => {
+      this.console.error(this.streamName, 'prebuffer session ended with error', e);
+      this.parserSessionPromise = undefined;
+    });
+    this.parserSessionPromise.then(pso => pso.killed.finally(() => {
+      this.console.error(this.streamName, 'prebuffer session ended');
+      this.parserSessionPromise = undefined;
+    }));
   }
 
   canUseRtspParser(mediaStreamOptions: MediaStreamOptions) {
@@ -398,7 +369,7 @@ class PrebufferSession {
           title: 'Detected Video/Audio Codecs',
           readonly: true,
           value: (session?.inputVideoCodec?.toString() || 'unknown') + '/' + (session?.inputAudioCodec?.toString() || 'unknown'),
-          description: 'Configuring your camera to H264 video and Opus, PCM, or AAC audio is recommended.'
+          description: 'Configuring your camera to H264 video, and audio to Opus or PCM-mulaw (G.711ulaw) is recommended.'
         },
         {
           key: 'detectedKeyframe',
@@ -467,85 +438,23 @@ class PrebufferSession {
     const audioSoftMuted = mso?.audio === null;
     const advertisedAudioCodec = mso?.audio?.codec;
 
-    const { isUsingDefaultAudioConfig, aacAudio, compatibleAudio, reencodeAudio } = this.getAudioConfig();
-
     let detectedAudioCodec = this.storage.getItem(this.lastDetectedAudioCodecKey) || undefined;
     if (detectedAudioCodec === 'null')
       detectedAudioCodec = null;
 
-    // the assumed audio codec is the detected codec first and the reported codec otherwise.
-    const assumedAudioCodec = detectedAudioCodec === undefined
-      ? advertisedAudioCodec?.toLowerCase()
-      : detectedAudioCodec?.toLowerCase();
-
-
-    // after probing the audio codec is complete, alert the user with appropriate instructions.
-    // assume the codec is user configurable unless the camera explictly reports otherwise.
-    const audioIncompatible = !COMPATIBLE_AUDIO_CODECS.includes(assumedAudioCodec);
-
-
-    // aac needs to have the adts header stripped for mpegts and mp4.
-    // use this filter sparingly as it prevents ffmpeg from starting on a mismatch.
-    // however, not using it on an aac stream also prevents ffmpeg from parsing.
-    // so only use it when the detected or probe codec reports aac.
-    const aacFilters = ['-bsf:a', 'aac_adtstoasc'];
-    // compatible audio like mp3, mp2, opus can be muxed without issue.
-    const compatibleFilters = [];
-
     this.audioDisabled = false;
     let acodec: string[];
-
-    const detectedNoAudio = detectedAudioCodec === null;
-
-    // if the camera reports audio is incompatible and the user can't do anything about it
-    // enable transcoding by default. however, still allow the user to change the settings
-    // in case something changed.
-    let mustTranscode = false;
-
 
     if (audioSoftMuted) {
       // no audio? explicitly disable it.
       acodec = ['-an'];
       this.audioDisabled = true;
     }
-    else if (reencodeAudio || mustTranscode) {
-      acodec = [
-        '-bsf:a', 'aac_adtstoasc',
-        '-acodec', 'aac',
-        '-ar', `32k`,
-        '-b:a', `32k`,
-        '-ac', `1`,
-        '-profile:a', 'aac_low',
-        '-flags', '+global_header',
-      ];
-    }
-    else if (aacAudio || detectedNoAudio) {
-      // NOTE: If there is no audio track, the aac filters will still work fine without complaints
-      // from ffmpeg. This is why AAC and No Audio can be grouped into a single setting.
-      // This is preferred, because failure and recovery is preferable to
-      // permanently muting camera audio due to erroneous detection.
-      acodec = [
-        '-acodec',
-        'copy',
-      ];
-      acodec.push(...aacFilters);
-    }
-    else if (compatibleAudio) {
-      acodec = [
-        '-acodec',
-        'copy',
-      ];
-      acodec.push(...compatibleFilters);
-    }
     else {
       acodec = [
         '-acodec',
         'copy',
       ];
-
-      const filters = assumedAudioCodec === 'aac' ? aacFilters : compatibleFilters;
-
-      acodec.push(...filters);
     }
 
     const vcodec = [
@@ -707,6 +616,8 @@ class PrebufferSession {
       }, h264Oddities ? 60000 : 10000);
     }
 
+    await session.sdp;
+
     // complain to the user about the codec if necessary. upstream may send a audio
     // stream but report none exists (to request muting).
     if (!audioSoftMuted && advertisedAudioCodec && session.inputAudioCodec !== undefined
@@ -722,12 +633,6 @@ class PrebufferSession {
 
     if (!session.inputAudioCodec) {
       this.console.log('No audio stream detected.');
-    }
-    else if (!COMPATIBLE_AUDIO_CODECS.includes(session.inputAudioCodec?.toLowerCase())) {
-      this.console.log('Detected audio codec is not mp4/mpegts compatible.', session.inputAudioCodec);
-    }
-    else {
-      this.console.log('Detected audio codec is mp4/mpegts compatible.', session.inputAudioCodec);
     }
 
     // set/update the detected codec, set it to null if no audio was found.
@@ -1115,17 +1020,8 @@ class PrebufferSession {
 
     mediaStreamOptions.prebuffer = requestedPrebuffer;
 
-    const { reencodeAudio } = this.getAudioConfig();
-
     if (this.audioDisabled) {
       mediaStreamOptions.audio = null;
-    }
-    else if (reencodeAudio) {
-      mediaStreamOptions.audio = {
-        codec: 'aac',
-        encoder: 'aac',
-        profile: 'aac_low',
-      }
     }
 
     if (session.inputVideoResolution?.width && session.inputVideoResolution?.height) {
@@ -1183,12 +1079,25 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
 
     this.delayStart();
 
-    this.startRtspServer();
+    (async () => {
+      let retry = 1000;
+      while (true) {
+        try {
+          await this.startRtspServer();
+          break;
+        }
+        catch (e) {
+          this.console.warn('Error starting RTSP Rebroadcast Server. Retrying shortly. If this problem persists, consider assigning a different port. This warning can be ignored if the rebroadcast URL is not in use.', e);
+          await sleep(retry);
+          retry = Math.min(60000, retry * 2);
+        }
+      }
+    })();
 
     this.settingsListener = systemManager.listenDevice(this.id, ScryptedInterface.Settings, () => this.ensurePrebufferSessions());
   }
 
-  startRtspServer() {
+  async startRtspServer() {
     closeQuiet(this.rtspServer);
 
     this.rtspServer = new net.Server(async (client) => {
@@ -1263,10 +1172,10 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
 
     this.rtspServer.listen(this.streamSettings.storageSettings.values.rebroadcastPort || 0);
 
-    once(this.rtspServer, 'listening').then(() => {
+    await once(this.rtspServer, 'listening').then(() => {
       const port = (this.rtspServer.address() as AddressInfo).port;
       this.streamSettings.storageSettings.values.rebroadcastPort = port;
-    })
+    });
   }
 
   delayStart() {
@@ -1416,7 +1325,7 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
       const cloud = msos?.find(mso => mso.source === 'cloud');
       if (cloud) {
         this.storage.setItem('warnedCloud', 'true');
-        log.a(`${this.name} is a cloud camera. Prebuffering maintains a persistent stream and will not enabled by default. You must enable the Prebuffer stream manually.`)
+        log.a(`${this.name} is a cloud camera. Prebuffering maintains a persistent stream and will not be enabled by default. You must enable the Prebuffer stream manually.`)
       }
     }
 
@@ -1469,17 +1378,14 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
           session.ensurePrebufferSession();
           let wasActive = false;
           try {
-            this.console.log('prebuffer session starting');
+            this.console.log(name, 'prebuffer session starting');
             const ps = await session.parserSessionPromise;
-            this.console.log('prebuffer session started');
             active++;
             wasActive = true;
             this.online = !!active;
             await ps.killed;
-            this.console.error('prebuffer session ended');
           }
           catch (e) {
-            this.console.error('prebuffer session ended with error', e);
           }
           finally {
             if (wasActive)
@@ -1487,10 +1393,10 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
             wasActive = false;
             this.online = !!active;
           }
-          this.console.log('restarting prebuffer session in 5 seconds');
+          this.console.log(this.name, 'restarting prebuffer session in 5 seconds');
           await new Promise(resolve => setTimeout(resolve, 5000));
         }
-        this.console.log('exiting prebuffer session (released or restarted with new configuration)');
+        this.console.log(name, 'exiting prebuffer session (released or restarted with new configuration)');
       })();
     }
 
@@ -1597,10 +1503,11 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
   }
 
   async release() {
+    closeQuiet(this.rtspServer);
     this.settingsListener.removeListener();
     this.online = true;
     super.release();
-    this.console.log('prebuffer session releasing if started');
+    this.console.log('prebuffer sessions releasing if started');
     this.released = true;
     for (const session of this.sessions.values()) {
       session?.release();

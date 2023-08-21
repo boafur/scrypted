@@ -131,6 +131,7 @@ export enum ScryptedDeviceType {
   SecuritySystem = "SecuritySystem",
   WindowCovering = "WindowCovering",
   Siren = "Siren",
+  AirPurifier = "AirPurifier",
   Unknown = "Unknown",
 }
 /**
@@ -1053,7 +1054,7 @@ export interface Charger {
 }
 
 export interface Reboot {
-  reboot(): Promise<void>;  
+  reboot(): Promise<void>;
 }
 /**
  * Refresh indicates that this device has properties that are not automatically updated, and must be periodically refreshed via polling. Device implementations should never implement their own underlying polling algorithm, and instead implement Refresh to allow Scrypted to manage polling intelligently.
@@ -1181,6 +1182,36 @@ export interface Position {
 export interface PositionSensor {
   position?: Position;
 }
+export enum AirPurifierStatus {
+  Inactive = "Inactive",
+  Idle = "Idle",
+  Active = "Active",
+  ActiveNightMode = "ActiveNightMode",
+}
+
+export enum AirPurifierMode {
+  Manual = "Manual",
+  Automatic = "Automatic",
+}
+
+export interface AirPurifierState {
+  speed?: number;
+  status?: AirPurifierStatus,
+  mode?: AirPurifierMode,
+  lockPhysicalControls?: boolean,
+}
+
+export interface AirPurifier {
+  airPurifierState?: AirPurifierState;
+
+  setAirPurifierState(state: AirPurifierState): Promise<void>;
+}
+
+export interface FilterMaintenance {
+  filterLifeLevel?: number,
+  filterChangeIndication?: boolean,
+}
+
 export interface PM10Sensor {
   pm10Density?: number;
 }
@@ -1380,9 +1411,10 @@ export interface VideoFrame {
 export interface VideoFrameGeneratorOptions extends ImageOptions {
   queue?: number;
   fps?: number;
+  firstFrameOnly?: boolean;
 }
 export interface VideoFrameGenerator {
-  generateVideoFrames(mediaObject: MediaObject, options?: VideoFrameGeneratorOptions, filter?: (videoFrame: VideoFrame) => Promise<boolean>): Promise<AsyncGenerator<VideoFrame>>;
+  generateVideoFrames(mediaObject: MediaObject, options?: VideoFrameGeneratorOptions, filter?: (videoFrame: VideoFrame) => Promise<boolean>): Promise<AsyncGenerator<VideoFrame, void>>;
 }
 /**
  * Logger is exposed via log.* to allow writing to the Scrypted log.
@@ -1824,7 +1856,7 @@ export interface HttpResponseOptions {
   headers?: object;
 }
 export interface EngineIOHandler {
-  onConnection(request: HttpRequest, webScoket: WebSocket): Promise<void>;
+  onConnection(request: HttpRequest, webSocket: WebSocket): Promise<void>;
 
 }
 /**
@@ -1950,6 +1982,8 @@ export enum ScryptedInterface {
   NOXSensor = "NOXSensor",
   CO2Sensor = "CO2Sensor",
   AirQualitySensor = "AirQualitySensor",
+  AirPurifier = "AirPurifier",
+  FilterMaintenance = "FilterMaintenance",
   Readme = "Readme",
   OauthClient = "OauthClient",
   MixinProvider = "MixinProvider",
@@ -1981,9 +2015,17 @@ export type RTCSignalingSendIceCandidate = (candidate: RTCIceCandidateInit) => P
  * @category WebRTC Reference
  */
 export interface RTCSignalingSession {
+  __proxy_props: {
+    options: RTCSignalingOptions;
+  };
+  options: RTCSignalingOptions;
+
   createLocalDescription(type: 'offer' | 'answer', setup: RTCAVSignalingSetup, sendIceCandidate: undefined | RTCSignalingSendIceCandidate): Promise<RTCSessionDescriptionInit>;
   setRemoteDescription(description: RTCSessionDescriptionInit, setup: RTCAVSignalingSetup): Promise<void>;
   addIceCandidate(candidate: RTCIceCandidateInit): Promise<void>;
+  /**
+   * @deprecated
+   */
   getOptions(): Promise<RTCSignalingOptions>;
 }
 

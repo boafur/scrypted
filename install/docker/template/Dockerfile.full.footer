@@ -3,15 +3,51 @@
 ################################################################
 FROM header as base
 
+# intel opencl gpu for openvino
+RUN bash -c "if [ \"$(uname -m)\" == \"x86_64\" ]; \
+    then \
+        apt-get update && apt-get install -y gpg-agent && \
+        rm -f /usr/share/keyrings/intel-graphics.gpg && \
+        curl -L https://repositories.intel.com/graphics/intel-graphics.key | gpg --dearmor --output /usr/share/keyrings/intel-graphics.gpg && \
+        echo 'deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/graphics/ubuntu jammy arc' | tee  /etc/apt/sources.list.d/intel.gpu.jammy.list && \
+        apt-get -y update && \
+        apt-get -y install intel-opencl-icd intel-media-va-driver-non-free && \
+        apt-get -y dist-upgrade; \
+    fi"
+
+# python 3.9 from ppa.
+# 3.9 is the version with prebuilt support for tensorflow lite
+RUN add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get -y install \
+    python3.9 \
+    python3.9-dev \
+    python3.9-distutils
+
+# allow pip to install to system
+RUN rm -f /usr/lib/python**/EXTERNALLY-MANAGED
+
+RUN python3.9 -m pip install --upgrade pip
+RUN python3.9 -m pip install --force-reinstall --no-binary :all: cffi
+RUN python3.9 -m pip install debugpy typing_extensions psutil
+
+# Coral Edge TPU
+# https://coral.ai/docs/accelerator/get-started/#runtime-on-linux
+RUN echo "deb https://packages.cloud.google.com/apt coral-edgetpu-stable main" | tee /etc/apt/sources.list.d/coral-edgetpu.list
+RUN curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+RUN apt-get -y update && apt-get -y install libedgetpu1-std
+
 ENV SCRYPTED_INSTALL_ENVIRONMENT="docker"
 ENV SCRYPTED_CAN_RESTART="true"
 ENV SCRYPTED_VOLUME="/server/volume"
 ENV SCRYPTED_INSTALL_PATH="/server"
 
+RUN test -f "/usr/bin/ffmpeg"
+ENV SCRYPTED_FFMPEG_PATH="/usr/bin/ffmpeg"
+
 # changing this forces pip and npm to perform reinstalls.
 # if this base image changes, this version must be updated.
-ENV SCRYPTED_BASE_VERSION=20230527
-ENV SCRYPTED_DOCKER_FLAVOR=full
+ENV SCRYPTED_BASE_VERSION="20230727"
+ENV SCRYPTED_DOCKER_FLAVOR="full"
 
 ################################################################
 # End section generated from template/Dockerfile.full.footer

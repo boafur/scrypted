@@ -1,13 +1,11 @@
-import os from 'os';
 import { Device, EngineIOHandler } from '@scrypted/types';
 import AdmZip from 'adm-zip';
 import crypto from 'crypto';
 import * as io from 'engine.io';
 import fs from 'fs';
-import mkdirp from 'mkdirp';
 import net from 'net';
+import os from 'os';
 import path from 'path';
-import rimraf from 'rimraf';
 import { Duplex } from 'stream';
 import WebSocket from 'ws';
 import { Plugin } from '../db-types';
@@ -205,9 +203,17 @@ export class PluginHost {
         {
             const zipDirTmp = zipDir + '.tmp';
             if (!fs.existsSync(zipFile)) {
-                rimraf.sync(zipDirTmp);
-                rimraf.sync(zipDir);
-                mkdirp.sync(zipDirTmp);
+                fs.rmSync(zipDirTmp, {
+                    recursive: true,
+                    force: true,
+                });
+                fs.rmSync(zipDir, {
+                    recursive: true,
+                    force: true,
+                });
+                fs.mkdirSync(zipDirTmp, {
+                    recursive: true,
+                });
                 fs.writeFileSync(path.join(zipDirTmp, zipFilename), zipBuffer);
                 const admZip = new AdmZip(zipBuffer);
                 admZip.extractAllTo(path.join(zipDirTmp, 'unzipped'), true);
@@ -294,6 +300,7 @@ export class PluginHost {
             throw new Error(`Unsupported Scrypted runtime: ${this.packageJson.scrypted.runtime}`);
 
         this.worker = workerHost(this.scrypted.mainFilename, this.pluginId, {
+            packageJson: this.packageJson,
             env,
             pluginDebug,
         });

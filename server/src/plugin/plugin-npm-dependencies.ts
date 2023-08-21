@@ -1,11 +1,9 @@
 import child_process from 'child_process';
 import { once } from 'events';
 import fs from 'fs';
-import mkdirp from "mkdirp";
 import os from 'os';
 import path from 'path';
 import process from 'process';
-import rimraf from "rimraf";
 import semver from 'semver';
 import { ensurePluginVolume } from "./plugin-volume";
 
@@ -13,7 +11,7 @@ export function defaultNpmExec(args: string[], options: child_process.SpawnOptio
     let npm = 'npm';
     if (os.platform() === 'win32')
         npm += '.cmd';
-    const cp = child_process.spawn(npm,  args, options);
+    const cp = child_process.spawn(npm, args, options);
     return cp;
 }
 
@@ -66,7 +64,9 @@ export async function installOptionalDependencies(console: Console, packageJson:
         delete reduced.devDependencies;
         delete reduced.scripts;
 
-        mkdirp.sync(nodePrefix);
+        await fs.promises.mkdir(nodePrefix, {
+            recursive: true,
+        })
         fs.writeFileSync(packageJsonPath, JSON.stringify(reduced));
 
         const cp = npmExecFunction(['--prefix', nodePrefix, 'install'], {
@@ -95,7 +95,10 @@ export async function installOptionalDependencies(console: Console, packageJson:
                 || de.name.startsWith('python') || de.name.startsWith('node')) {
                 console.log('Removing old dependencies:', filePath);
                 try {
-                    rimraf.sync(filePath);
+                    await fs.promises.rm(filePath, {
+                        recursive: true,
+                        force: true,
+                    });
                 }
                 catch (e) {
                 }
